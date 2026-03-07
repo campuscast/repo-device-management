@@ -1,12 +1,14 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { Device } from './device.entity';
+import { DeviceCredential } from './device-credential.entity';
 import { DevicesService } from './devices.service';
 import { DevicesController } from './devices.controller';
+import { InternalOrJwtGuard } from './internal-or-jwt.guard';
 
 @Module({
-  imports: [TypeOrmModule.forFeature([Device])],
-  providers: [DevicesService],
+  imports: [TypeOrmModule.forFeature([Device, DeviceCredential])],
+  providers: [DevicesService, InternalOrJwtGuard],
   controllers: [DevicesController],
   exports: [DevicesService],
 })
