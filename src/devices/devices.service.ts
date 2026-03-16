@@ -1,10 +1,17 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Device } from './device.entity';
 import { DeviceCredential } from './device-credential.entity';
-import { createHash, createHmac, randomUUID } from 'crypto';
+import { createHash, createHmac, randomUUID, randomInt } from 'crypto';
 import { AuditClient } from '@campuscast/shared-libs';
+
+/** Generate UUID device ID */
+function generatePlayerId(): string {
+  return randomUUID();
+}
+
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 @Injectable()
 export class DevicesService {
@@ -17,19 +24,61 @@ export class DevicesService {
     @InjectRepository(DeviceCredential) private credentialRepo: Repository<DeviceCredential>,
   ) {}
 
+  /** Convert canonical UUID to short player-facing ID: XXXX-XXXX-XXXX-XXXX */
+  formatPlayerId(deviceId: string): string {
+    const compact = deviceId.replace(/[^0-9a-f]/gi, '').slice(0, 16).toUpperCase();
+    if (compact.length !== 16) return deviceId.toUpperCase();
+    return `${compact.slice(0, 4)}-${compact.slice(4, 8)}-${compact.slice(8, 12)}-${compact.slice(12, 16)}`;
+  }
+
+  private normalizeShortPlayerId(raw: string): string | null {
+    const compact = raw.replace(/[^0-9a-f]/gi, '').toLowerCase();
+    if (compact.length !== 16) return null;
+    return /^[0-9a-f]{16}$/.test(compact) ? compact : null;
+  }
+
+  private async findByShortPlayerId(shortId: string): Promise<Device> {
+    const matches = await this.repo
+      .createQueryBuilder('device')
+      .where(
+        "left(replace(lower(cast(device.device_id as text)), '-', ''), 16) = :shortId",
+        { shortId }
+      )
+      .getMany();
+
+    if (matches.length === 1) return matches[0];
+    if (matches.length > 1) {
+      throw new BadRequestException('Player ID is ambiguous. Use full Device ID.');
+    }
+    throw new NotFoundException('Device not found');
+  }
+
   async findByZone(zoneId: string) {
     return this.repo.find({ where: { zone_id: zoneId } });
   }
 
   async findOne(deviceId: string) {
-    const d = await this.repo.findOne({ where: { device_id: deviceId } });
-    if (!d) throw new NotFoundException('Device not found');
-    return d;
+    const input = deviceId.trim();
+    if (!input) throw new NotFoundException('Device not found');
+
+    if (UUID_REGEX.test(input)) {
+      const d = await this.repo.findOne({ where: { device_id: input } });
+      if (!d) throw new NotFoundException('Device not found');
+      return d;
+    }
+
+    const shortId = this.normalizeShortPlayerId(input);
+    if (shortId) {
+      return this.findByShortPlayerId(shortId);
+    }
+
+    throw new NotFoundException('Device not found');
   }
 
   private async createDevice(data: { device_name: string; device_type: string; hardware_id?: string; zone_id: string; group_id: string }) {
     const device = this.repo.create({
       ...data,
+      device_id: generatePlayerId(),
       status: 'active',
       mqtt_client_id: `dev-${randomUUID().slice(0, 8)}`,
     });
@@ -100,36 +149,172 @@ export class DevicesService {
     return this.register(data);
   }
 
-  async assignToGroup(deviceId: string, groupId: string) {
-    await this.repo.update({ device_id: deviceId }, { group_id: groupId });
-    const device = await this.findOne(deviceId);
+  /** Create device with status='pending' — no token issued yet. */
+  async createPending(data: { device_name: string; device_type?: string; hardware_id?: string; zone_id: string; group_id: string }) {
+    const device = this.repo.create({
+      ...data,
+      device_id: generatePlayerId(),
+      device_type: data.device_type || '',
+      status: 'pending',
+      mqtt_client_id: `dev-${randomUUID().slice(0, 8)}`,
+    });
+    const saved = await this.repo.save(device);
 
     await this.auditClient.append({
-      event_type: 'device.assigned',
+      event_type: 'device.enrolled',
+      actor_type: 'system',
+      actor_id: 'device-management',
+      zone_id: saved.zone_id,
+      resource_type: 'device',
+      resource_id: saved.device_id,
+      action: 'created_pending',
+      detail: {
+        device_type: saved.device_type,
+        group_id: saved.group_id,
+      },
+    });
+
+    return {
+      device_id: saved.device_id,
+      player_id: this.formatPlayerId(saved.device_id),
+    };
+  }
+
+  /** Activate a pending device: set status='active', issue token, return credentials. */
+  async activateDevice(deviceId: string) {
+    const device = await this.findOne(deviceId);
+    const alreadyActive = device.status !== 'pending';
+
+    if (!alreadyActive) {
+      await this.repo.update({ device_id: device.device_id }, { status: 'active' });
+      device.status = 'active';
+    }
+
+    const { token, jti, expiresAt } = this.issueDeviceToken(device);
+
+    await this.credentialRepo.save(this.credentialRepo.create({
+      device_id: device.device_id,
+      token_jti: jti,
+      token_hash: createHash('sha256').update(token).digest('hex'),
+      algorithm: 'HS256',
+      expires_at: expiresAt,
+      revoked: false,
+    }));
+
+    if (!alreadyActive) {
+      await this.auditClient.append({
+        event_type: 'device.enrolled',
+        actor_type: 'system',
+        actor_id: 'device-management',
+        zone_id: device.zone_id,
+        resource_type: 'device',
+        resource_id: device.device_id,
+        action: 'activated',
+        detail: {
+          device_type: device.device_type,
+          group_id: device.group_id,
+        },
+      });
+    }
+
+    return {
+      device_id: device.device_id,
+      device_token: token,
+      mqtt_client_id: device.mqtt_client_id,
+      mqtt_topic_prefix: `zones/${device.zone_id}/groups/${device.group_id}`,
+      token_expires_at: expiresAt.toISOString(),
+      already_active: alreadyActive,
+    };
+  }
+
+  /** Update hardware_id on a device. */
+  async updateHardwareId(deviceId: string, hardwareId: string) {
+    const device = await this.findOne(deviceId);
+    await this.repo.update({ device_id: device.device_id }, { hardware_id: hardwareId });
+  }
+
+  /** Permanently delete a device and its credentials. */
+  async deleteDevice(deviceId: string) {
+    const device = await this.findOne(deviceId);
+
+    // Remove credentials first (FK-like cleanup)
+    await this.credentialRepo.delete({ device_id: device.device_id });
+    await this.repo.delete({ device_id: device.device_id });
+
+    await this.auditClient.append({
+      event_type: 'device.deleted',
       actor_type: 'system',
       actor_id: 'device-management',
       zone_id: device.zone_id,
       resource_type: 'device',
       resource_id: device.device_id,
+      action: 'deleted',
+      detail: {
+        device_name: device.device_name,
+        device_type: device.device_type,
+      },
+    });
+
+    return { success: true };
+  }
+
+  /** Update device fields (name, type, etc.). */
+  async updateDevice(deviceId: string, updates: { device_name?: string; device_type?: string }) {
+    const device = await this.findOne(deviceId);
+    if (updates.device_name !== undefined) device.device_name = updates.device_name;
+    if (updates.device_type !== undefined) device.device_type = updates.device_type;
+    const saved = await this.repo.save(device);
+
+    await this.auditClient.append({
+      event_type: 'device.updated',
+      actor_type: 'system',
+      actor_id: 'device-management',
+      zone_id: saved.zone_id,
+      resource_type: 'device',
+      resource_id: saved.device_id,
+      action: 'updated',
+      detail: updates,
+    });
+
+    return saved;
+  }
+
+  async assignToGroup(deviceId: string, groupId: string) {
+    const device = await this.findOne(deviceId);
+    await this.repo.update({ device_id: device.device_id }, { group_id: groupId });
+    const updated = await this.findOne(device.device_id);
+
+    await this.auditClient.append({
+      event_type: 'device.assigned',
+      actor_type: 'system',
+      actor_id: 'device-management',
+      zone_id: updated.zone_id,
+      resource_type: 'device',
+      resource_id: updated.device_id,
       action: 'assigned',
       detail: { group_id: groupId },
     });
 
-    return device;
+    return updated;
   }
 
   async revoke(deviceId: string) {
-    await this.repo.update({ device_id: deviceId }, { status: 'revoked' });
+    const device = await this.findOne(deviceId);
+    await this.repo.update({ device_id: device.device_id }, { status: 'revoked' });
     await this.credentialRepo.update(
-      { device_id: deviceId, revoked: false },
+      { device_id: device.device_id, revoked: false },
       { revoked: true, revoked_reason: 'device_revoked', revoked_at: new Date() },
     );
     return { success: true };
   }
 
   async bindPublicKey(deviceId: string, publicKey: string, algorithm: string) {
+    const device = await this.findOne(deviceId);
     const keyId = `key-${randomUUID().slice(0, 8)}`;
-    await this.repo.update({ device_id: deviceId }, { public_key: publicKey, key_algorithm: algorithm, key_id: keyId, status: 'active' });
+    await this.repo.update(
+      { device_id: device.device_id },
+      { public_key: publicKey, key_algorithm: algorithm, key_id: keyId, status: 'active' }
+    );
     return { key_id: keyId, success: true };
   }
 

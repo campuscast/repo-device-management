@@ -1,4 +1,4 @@
-import { Controller, Get, Put, Post, Param, Body, Query, Logger, UseGuards } from '@nestjs/common';
+import { Controller, Get, Put, Patch, Post, Delete, Param, Body, Query, Logger, UseGuards } from '@nestjs/common';
 import { DevicesService } from './devices.service';
 import { JwtAuthGuard, ZoneScopeGuard } from '@campuscast/shared-libs';
 import { InternalOrJwtGuard } from './internal-or-jwt.guard';
@@ -17,7 +17,8 @@ export class DevicesController {
   @Get()
   @UseGuards(JwtAuthGuard, ZoneScopeGuard)
   async list(@Query('zone_id') zoneId: string) {
-    return this.svc.findByZone(zoneId);
+    const data = await this.svc.findByZone(zoneId);
+    return { data };
   }
 
   @Get(':deviceId')
@@ -30,6 +31,18 @@ export class DevicesController {
   @UseGuards(JwtAuthGuard)
   async assign(@Param('deviceId') id: string, @Body() body: { group_id: string }) {
     return this.svc.assignToGroup(id, body.group_id);
+  }
+
+  @Patch(':deviceId')
+  @UseGuards(JwtAuthGuard)
+  async update(@Param('deviceId') id: string, @Body() body: { device_name?: string; device_type?: string }) {
+    return this.svc.updateDevice(id, body);
+  }
+
+  @Delete(':deviceId')
+  @UseGuards(JwtAuthGuard)
+  async remove(@Param('deviceId') id: string) {
+    return this.svc.deleteDevice(id);
   }
 
   @Put(':deviceId/revoke')

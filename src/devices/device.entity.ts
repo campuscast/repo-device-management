@@ -1,15 +1,15 @@
-import { Entity, PrimaryGeneratedColumn, Column, CreateDateColumn, UpdateDateColumn } from 'typeorm';
+import { Entity, PrimaryColumn, Column, CreateDateColumn, UpdateDateColumn } from 'typeorm';
 
 @Entity('devices')
 export class Device {
-  @PrimaryGeneratedColumn('uuid')
+  @PrimaryColumn({ type: 'uuid', default: () => 'uuid_generate_v4()' })
   device_id: string;
 
   @Column()
   device_name: string;
 
-  @Column()
-  device_type: string; // "android_tv", "desktop", "web"
+  @Column({ default: '' })
+  device_type: string; // "android_tv", "desktop", "web", "" (not yet determined)
 
   @Column({ nullable: true })
   hardware_id: string;

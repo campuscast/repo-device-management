@@ -6,6 +6,7 @@ import { DevicesModule } from './devices/devices.module';
 import { EnrollmentModule } from './enrollment/enrollment.module';
 import { Device } from './devices/device.entity';
 import { DeviceCredential } from './devices/device-credential.entity';
+import { ActivationCode } from './enrollment/activation-code.entity';
 import { HealthController } from './common/health.controller';
 import { appConfig, dbConfig, redisConfig, validate } from './config';
 
@@ -19,7 +20,7 @@ import { appConfig, dbConfig, redisConfig, validate } from './config';
     TypeOrmModule.forRoot({
       type: 'postgres',
       url: process.env.DATABASE_URL || 'postgresql://campuscast:campuscast@localhost:5432/device_db',
-      entities: [Device, DeviceCredential],
+      entities: [Device, DeviceCredential, ActivationCode],
       synchronize: process.env.NODE_ENV === 'development',
     }),
     DevicesModule, EnrollmentModule,
