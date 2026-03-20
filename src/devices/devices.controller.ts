@@ -27,6 +27,12 @@ export class DevicesController {
     return this.svc.findOne(id);
   }
 
+  @Get(':deviceId/runtime')
+  @UseGuards(InternalOrJwtGuard)
+  async getRuntime(@Param('deviceId') id: string) {
+    return this.svc.getRuntimeDevice(id);
+  }
+
   @Put(':deviceId/assign')
   @UseGuards(JwtAuthGuard)
   async assign(@Param('deviceId') id: string, @Body() body: { group_id: string }) {
@@ -60,9 +66,20 @@ export class DevicesController {
   @Post('sync-group')
   async syncGroup(@Body() body: { zone_id: string; group_id: string; action: string }) {
     this.logger.log(`Group sync: zone=${body.zone_id} group=${body.group_id} action=${body.action}`);
-    // When a group is deleted, unassign devices from that group
+    // When a group is deleted, devices in that group must be deprovisioned.
     if (body.action === 'deleted') {
-      await this.svc.unassignGroup(body.group_id);
+      const removed = await this.svc.deleteByGroup(body.group_id);
+      this.logger.log(`Group sync deleted ${removed} device(s) for group=${body.group_id}`);
+    }
+    return { synced: true };
+  }
+
+  @Post('sync-zone')
+  async syncZone(@Body() body: { zone_id: string; action: string }) {
+    this.logger.log(`Zone sync: zone=${body.zone_id} action=${body.action}`);
+    if (body.action === 'deleted') {
+      const removed = await this.svc.deleteByZone(body.zone_id);
+      this.logger.log(`Zone sync deleted ${removed} device(s) for zone=${body.zone_id}`);
     }
     return { synced: true };
   }

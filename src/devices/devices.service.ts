@@ -1,6 +1,11 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  NotFoundException,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { In, Repository } from 'typeorm';
 import { Device } from './device.entity';
 import { DeviceCredential } from './device-credential.entity';
 import { createHash, createHmac, randomUUID, randomInt } from 'crypto';
@@ -18,6 +23,8 @@ export class DevicesService {
   private readonly jwtSecret = process.env.JWT_SECRET || 'dev-secret-change-in-production';
   private readonly tokenTtlSeconds = parseInt(process.env.DEVICE_TOKEN_TTL_SECONDS || '2592000', 10); // 30 days
   private readonly auditClient = new AuditClient();
+  private readonly zonePolicyUrl = process.env.ZONE_POLICY_URL || 'http://localhost:3002';
+  private readonly internalServiceToken = process.env.INTERNAL_SERVICE_TOKEN || '';
 
   constructor(
     @InjectRepository(Device) private repo: Repository<Device>,
@@ -318,7 +325,81 @@ export class DevicesService {
     return { key_id: keyId, success: true };
   }
 
-  async unassignGroup(groupId: string) {
-    await this.repo.update({ group_id: groupId }, { group_id: '' });
+  private async validateRuntimeAssignment(zoneId: string, groupId: string): Promise<'valid' | 'invalid' | 'unknown'> {
+    try {
+      const headers = this.internalServiceToken
+        ? { 'x-internal-token': this.internalServiceToken }
+        : undefined;
+
+      const zoneRes = await fetch(`${this.zonePolicyUrl}/zones/${encodeURIComponent(zoneId)}`, {
+        headers,
+        signal: AbortSignal.timeout(4000),
+      });
+
+      if (zoneRes.status === 404) return 'invalid';
+      if (!zoneRes.ok) return 'unknown';
+
+      const groupsRes = await fetch(`${this.zonePolicyUrl}/zones/${encodeURIComponent(zoneId)}/groups`, {
+        headers,
+        signal: AbortSignal.timeout(4000),
+      });
+
+      if (groupsRes.status === 404) return 'invalid';
+      if (!groupsRes.ok) return 'unknown';
+
+      const groups = await groupsRes.json() as Array<{ group_id?: string }>;
+      if (!Array.isArray(groups)) return 'unknown';
+
+      const hasGroup = groups.some((group) => group?.group_id === groupId);
+      return hasGroup ? 'valid' : 'invalid';
+    } catch {
+      return 'unknown';
+    }
   }
+
+  /**
+   * Runtime validation for player-facing auth:
+   * - device exists
+   * - status is active
+   * - zone/group assignment still exists in zone-policy
+   */
+  async getRuntimeDevice(deviceId: string): Promise<Device> {
+    const device = await this.findOne(deviceId);
+    if (device.status !== 'active' || !device.zone_id || !device.group_id) {
+      throw new NotFoundException('Device not found');
+    }
+
+    const assignmentStatus = await this.validateRuntimeAssignment(device.zone_id, device.group_id);
+    if (assignmentStatus === 'invalid') {
+      throw new NotFoundException('Device not found');
+    }
+    if (assignmentStatus === 'unknown') {
+      throw new ServiceUnavailableException('Device assignment validation unavailable');
+    }
+
+    return device;
+  }
+
+  async deleteByZone(zoneId: string): Promise<number> {
+    const devices = await this.repo.find({ select: ['device_id'], where: { zone_id: zoneId } });
+    const deviceIds = devices.map((device) => device.device_id);
+    if (deviceIds.length === 0) return 0;
+
+    await this.credentialRepo.delete({ device_id: In(deviceIds) });
+    await this.repo.delete({ device_id: In(deviceIds) });
+
+    return deviceIds.length;
+  }
+
+  async deleteByGroup(groupId: string): Promise<number> {
+    const devices = await this.repo.find({ select: ['device_id'], where: { group_id: groupId } });
+    const deviceIds = devices.map((device) => device.device_id);
+    if (deviceIds.length === 0) return 0;
+
+    await this.credentialRepo.delete({ device_id: In(deviceIds) });
+    await this.repo.delete({ device_id: In(deviceIds) });
+
+    return deviceIds.length;
+  }
+
 }
