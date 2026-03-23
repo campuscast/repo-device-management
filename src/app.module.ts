@@ -6,8 +6,10 @@ import { DevicesModule } from './devices/devices.module';
 import { EnrollmentModule } from './enrollment/enrollment.module';
 import { Device } from './devices/device.entity';
 import { DeviceCredential } from './devices/device-credential.entity';
+import { DevicePreview } from './devices/device-preview.entity';
 import { ActivationCode } from './enrollment/activation-code.entity';
 import { Init1700000000000 } from './migrations/1700000000000-Init';
+import { DevicePreviews1700000000001 } from './migrations/1700000000001-DevicePreviews';
 import { HealthController } from './common/health.controller';
 import { appConfig, dbConfig, redisConfig, validate } from './config';
 
@@ -24,8 +26,8 @@ const dbMigrationsRun = process.env.DB_MIGRATIONS_RUN !== 'false';
     TypeOrmModule.forRoot({
       type: 'postgres',
       url: process.env.DATABASE_URL || 'postgresql://campuscast:campuscast@localhost:5432/device_db',
-      entities: [Device, DeviceCredential, ActivationCode],
-      migrations: [Init1700000000000],
+      entities: [Device, DeviceCredential, DevicePreview, ActivationCode],
+      migrations: [Init1700000000000, DevicePreviews1700000000001],
       migrationsRun: dbMigrationsRun,
       synchronize: dbSynchronize,
       logging: process.env.NODE_ENV === 'development',

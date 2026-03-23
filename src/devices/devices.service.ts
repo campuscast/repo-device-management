@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   Injectable,
+  Logger,
   NotFoundException,
   ServiceUnavailableException,
 } from '@nestjs/common';
@@ -8,8 +9,9 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { In, Repository } from 'typeorm';
 import { Device } from './device.entity';
 import { DeviceCredential } from './device-credential.entity';
+import { DevicePreview } from './device-preview.entity';
 import { createHash, createHmac, randomUUID, randomInt } from 'crypto';
-import { AuditClient } from '@campuscast/shared-libs';
+import { AuditClient, type AuditEventPayload } from '@campuscast/shared-libs';
 
 /** Generate UUID device ID */
 function generatePlayerId(): string {
@@ -20,6 +22,7 @@ const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-
 
 @Injectable()
 export class DevicesService {
+  private readonly logger = new Logger(DevicesService.name);
   private readonly jwtSecret = process.env.JWT_SECRET || 'dev-secret-change-in-production';
   private readonly tokenTtlSeconds = parseInt(process.env.DEVICE_TOKEN_TTL_SECONDS || '2592000', 10); // 30 days
   private readonly auditClient = new AuditClient();
@@ -29,6 +32,7 @@ export class DevicesService {
   constructor(
     @InjectRepository(Device) private repo: Repository<Device>,
     @InjectRepository(DeviceCredential) private credentialRepo: Repository<DeviceCredential>,
+    @InjectRepository(DevicePreview) private previewRepo: Repository<DevicePreview>,
   ) {}
 
   /** Convert canonical UUID to short player-facing ID: XXXX-XXXX-XXXX-XXXX */
@@ -82,6 +86,82 @@ export class DevicesService {
     throw new NotFoundException('Device not found');
   }
 
+  async getDevicePreview(deviceId: string) {
+    const device = await this.findOne(deviceId);
+    const preview = await this.previewRepo.findOne({ where: { device_id: device.device_id } });
+    if (!preview) {
+      return {
+        device_id: device.device_id,
+        device_name: device.device_name,
+        zone_id: device.zone_id,
+        group_id: device.group_id,
+        preview_available: false,
+        updated_at: null,
+      };
+    }
+
+    return {
+      device_id: device.device_id,
+      device_name: device.device_name,
+      zone_id: device.zone_id,
+      group_id: device.group_id,
+      preview_available: Boolean(preview.image_base64 || preview.image_url),
+      image_base64: preview.image_base64,
+      image_url: preview.image_url,
+      mime_type: preview.mime_type,
+      status: preview.status,
+      captured_at: preview.captured_at?.toISOString?.() || null,
+      width: preview.width,
+      height: preview.height,
+      updated_at: preview.updated_at?.toISOString?.() || null,
+    };
+  }
+
+  async upsertDevicePreview(deviceId: string, payload: {
+    image_base64?: string;
+    image_url?: string;
+    mime_type?: string;
+    status?: string;
+    captured_at?: string;
+    width?: number;
+    height?: number;
+  }) {
+    const device = await this.findOne(deviceId);
+    const current = await this.previewRepo.findOne({ where: { device_id: device.device_id } });
+    const capturedAt = payload.captured_at ? new Date(payload.captured_at) : null;
+    if (payload.captured_at && (!capturedAt || Number.isNaN(capturedAt.getTime()))) {
+      throw new BadRequestException('captured_at must be a valid ISO timestamp');
+    }
+
+    const next = current
+      ? { ...current }
+      : this.previewRepo.create({
+          device_id: device.device_id,
+          image_base64: null,
+          image_url: null,
+          mime_type: 'image/png',
+          status: 'ok',
+          captured_at: null,
+          width: null,
+          height: null,
+        });
+
+    if (payload.image_base64 !== undefined) next.image_base64 = payload.image_base64 || null;
+    if (payload.image_url !== undefined) next.image_url = payload.image_url || null;
+    if (payload.mime_type !== undefined) next.mime_type = payload.mime_type || 'image/png';
+    if (payload.status !== undefined) next.status = payload.status || null;
+    if (payload.width !== undefined) next.width = Number.isFinite(payload.width) ? payload.width : null;
+    if (payload.height !== undefined) next.height = Number.isFinite(payload.height) ? payload.height : null;
+    if (capturedAt) next.captured_at = capturedAt;
+
+    const saved = await this.previewRepo.save(next);
+    return {
+      preview_id: saved.preview_id,
+      device_id: saved.device_id,
+      updated_at: saved.updated_at?.toISOString?.() || null,
+    };
+  }
+
   private async createDevice(data: { device_name: string; device_type: string; hardware_id?: string; zone_id: string; group_id: string }) {
     const device = this.repo.create({
       ...data,
@@ -114,6 +194,17 @@ export class DevicesService {
     return { token, jti, expiresAt: new Date(exp * 1000) };
   }
 
+  /**
+   * Audit trail must not block core enrollment operations.
+   * Append asynchronously and log unexpected runtime failures.
+   */
+  private appendAudit(event: AuditEventPayload): void {
+    void this.auditClient.append(event).catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : 'unknown error';
+      this.logger.warn(`Audit append task crashed for event=${event.event_type} reason=${message}`);
+    });
+  }
+
   async register(data: { device_name: string; device_type: string; hardware_id?: string; zone_id: string; group_id: string }) {
     const device = await this.createDevice(data);
     const { token, jti, expiresAt } = this.issueDeviceToken(device);
@@ -135,7 +226,7 @@ export class DevicesService {
       token_expires_at: expiresAt.toISOString(),
     };
 
-    await this.auditClient.append({
+    this.appendAudit({
       event_type: 'device.enrolled',
       actor_type: 'system',
       actor_id: 'device-management',
@@ -167,7 +258,7 @@ export class DevicesService {
     });
     const saved = await this.repo.save(device);
 
-    await this.auditClient.append({
+    this.appendAudit({
       event_type: 'device.enrolled',
       actor_type: 'system',
       actor_id: 'device-management',
@@ -209,7 +300,7 @@ export class DevicesService {
     }));
 
     if (!alreadyActive) {
-      await this.auditClient.append({
+      this.appendAudit({
         event_type: 'device.enrolled',
         actor_type: 'system',
         actor_id: 'device-management',
@@ -248,7 +339,7 @@ export class DevicesService {
     await this.credentialRepo.delete({ device_id: device.device_id });
     await this.repo.delete({ device_id: device.device_id });
 
-    await this.auditClient.append({
+    this.appendAudit({
       event_type: 'device.deleted',
       actor_type: 'system',
       actor_id: 'device-management',
@@ -272,7 +363,7 @@ export class DevicesService {
     if (updates.device_type !== undefined) device.device_type = updates.device_type;
     const saved = await this.repo.save(device);
 
-    await this.auditClient.append({
+    this.appendAudit({
       event_type: 'device.updated',
       actor_type: 'system',
       actor_id: 'device-management',
@@ -291,7 +382,7 @@ export class DevicesService {
     await this.repo.update({ device_id: device.device_id }, { group_id: groupId });
     const updated = await this.findOne(device.device_id);
 
-    await this.auditClient.append({
+    this.appendAudit({
       event_type: 'device.assigned',
       actor_type: 'system',
       actor_id: 'device-management',

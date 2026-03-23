@@ -26,6 +26,7 @@ describe('DevicesService', () => {
 
   let deviceRepo: MockRepo<Device>;
   let credentialRepo: MockRepo<any>;
+  let previewRepo: MockRepo<any>;
   let service: DevicesService;
 
   beforeEach(() => {
@@ -49,7 +50,17 @@ describe('DevicesService', () => {
       createQueryBuilder: jest.fn(),
     };
 
-    service = new DevicesService(deviceRepo as any, credentialRepo as any);
+    previewRepo = {
+      find: jest.fn(),
+      findOne: jest.fn(),
+      delete: jest.fn(),
+      update: jest.fn(),
+      save: jest.fn(),
+      create: jest.fn(),
+      createQueryBuilder: jest.fn(),
+    };
+
+    service = new DevicesService(deviceRepo as any, credentialRepo as any, previewRepo as any);
   });
 
   afterEach(() => {

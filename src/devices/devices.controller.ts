@@ -1,12 +1,22 @@
-import { Controller, Get, Put, Patch, Post, Delete, Param, Body, Query, Logger, UseGuards } from '@nestjs/common';
+import { Controller, Get, Put, Patch, Post, Delete, Param, Body, Query, Logger, UseGuards, Req, UnauthorizedException } from '@nestjs/common';
 import { DevicesService } from './devices.service';
 import { JwtAuthGuard, ZoneScopeGuard } from '@campuscast/shared-libs';
 import { InternalOrJwtGuard } from './internal-or-jwt.guard';
+import { Request } from 'express';
 
 @Controller('devices')
 export class DevicesController {
   private readonly logger = new Logger(DevicesController.name);
   constructor(private svc: DevicesService) {}
+
+  private assertDeviceTokenSelfAccess(req: Request & { user?: { sub?: string; device_id?: string }; internalAuth?: { service?: boolean } }, deviceId: string) {
+    if (req.internalAuth?.service) return;
+    const tokenDeviceId = req.user?.sub || req.user?.device_id;
+    if (tokenDeviceId && tokenDeviceId === deviceId) return;
+    // Operator JWT is also accepted here (without strict device self-check).
+    if (req.user?.sub && !req.user?.device_id) return;
+    throw new UnauthorizedException('Device token is not allowed for this device_id');
+  }
 
   @Post('register')
   @UseGuards(JwtAuthGuard, ZoneScopeGuard)
@@ -31,6 +41,32 @@ export class DevicesController {
   @UseGuards(InternalOrJwtGuard)
   async getRuntime(@Param('deviceId') id: string) {
     return this.svc.getRuntimeDevice(id);
+  }
+
+  @Get(':deviceId/preview')
+  @UseGuards(InternalOrJwtGuard)
+  async getPreview(@Param('deviceId') id: string, @Req() req: Request & { user?: { sub?: string; device_id?: string }; internalAuth?: { service?: boolean } }) {
+    this.assertDeviceTokenSelfAccess(req, id);
+    return this.svc.getDevicePreview(id);
+  }
+
+  @Put(':deviceId/preview')
+  @UseGuards(InternalOrJwtGuard)
+  async putPreview(
+    @Param('deviceId') id: string,
+    @Body() body: {
+      image_base64?: string;
+      image_url?: string;
+      mime_type?: string;
+      status?: string;
+      captured_at?: string;
+      width?: number;
+      height?: number;
+    },
+    @Req() req: Request & { user?: { sub?: string; device_id?: string }; internalAuth?: { service?: boolean } },
+  ) {
+    this.assertDeviceTokenSelfAccess(req, id);
+    return this.svc.upsertDevicePreview(id, body);
   }
 
   @Put(':deviceId/assign')
