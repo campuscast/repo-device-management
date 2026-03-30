@@ -17,7 +17,7 @@ export class EnrollmentController {
   ) {}
 
   /** Resolve zone and group names from zone-policy service */
-  private async resolveZoneGroupNames(zoneId: string, groupId: string): Promise<{ zone_name: string; group_name: string }> {
+  private async resolveZoneGroupNames(zoneId: string, groupId?: string): Promise<{ zone_name: string; group_name: string }> {
     let zone_name = '';
     let group_name = '';
     try {
@@ -27,6 +27,9 @@ export class EnrollmentController {
       if (zoneRes.ok) {
         const zone = await zoneRes.json() as { name?: string };
         zone_name = zone.name ?? '';
+      }
+      if (!groupId) {
+        return { zone_name, group_name };
       }
       const groupsRes = await fetch(`${this.zonePolicyUrl}/zones/${zoneId}/groups`, {
         signal: AbortSignal.timeout(3000),
@@ -46,7 +49,7 @@ export class EnrollmentController {
 
   @Post()
   @UseGuards(JwtAuthGuard, ZoneScopeGuard)
-  async enroll(@Body() body: { device_name: string; device_type: string; hardware_id?: string; zone_id: string; group_id: string }) {
+  async enroll(@Body() body: { device_name: string; device_type: string; hardware_id?: string; zone_id: string; group_id?: string }) {
     return this.devicesSvc.register(body);
   }
 
@@ -54,7 +57,7 @@ export class EnrollmentController {
 
   @Post('create')
   @UseGuards(JwtAuthGuard, ZoneScopeGuard)
-  async createPending(@Body() body: { device_name: string; device_type?: string; hardware_id?: string; zone_id: string; group_id: string }) {
+  async createPending(@Body() body: { device_name: string; device_type?: string; hardware_id?: string; zone_id: string; group_id?: string }) {
     return this.devicesSvc.createPending(body);
   }
 

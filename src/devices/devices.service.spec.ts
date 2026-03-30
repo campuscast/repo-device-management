@@ -84,20 +84,15 @@ describe('DevicesService', () => {
     expect(deviceRepo.delete).toHaveBeenCalledTimes(1);
   });
 
-  it('deleteByGroup removes all devices and credentials in a group', async () => {
-    deviceRepo.find.mockResolvedValue([{ device_id: 'd1' }]);
-    credentialRepo.delete.mockResolvedValue({ affected: 1 });
-    deviceRepo.delete.mockResolvedValue({ affected: 1 });
+  it('unassignByGroup clears group membership without deleting devices', async () => {
+    deviceRepo.update.mockResolvedValue({ affected: 1 });
 
-    const removed = await service.deleteByGroup('group-1');
+    const updated = await service.unassignByGroup('group-1');
 
-    expect(removed).toBe(1);
-    expect(deviceRepo.find).toHaveBeenCalledWith({
-      select: ['device_id'],
-      where: { group_id: 'group-1' },
-    });
-    expect(credentialRepo.delete).toHaveBeenCalledTimes(1);
-    expect(deviceRepo.delete).toHaveBeenCalledTimes(1);
+    expect(updated).toBe(1);
+    expect(deviceRepo.update).toHaveBeenCalledWith({ group_id: 'group-1' }, { group_id: '' });
+    expect(credentialRepo.delete).not.toHaveBeenCalled();
+    expect(deviceRepo.delete).not.toHaveBeenCalled();
   });
 
   it('getRuntimeDevice rejects invalid assignment when group is missing', async () => {
@@ -141,6 +136,21 @@ describe('DevicesService', () => {
       .fn()
       .mockResolvedValueOnce(makeResponse(200, { zone_id: 'zone-1' }))
       .mockResolvedValueOnce(makeResponse(200, [{ group_id: 'group-1' }]));
+
+    await expect(service.getRuntimeDevice(deviceId)).resolves.toEqual(activeDevice);
+  });
+
+  it('getRuntimeDevice accepts active device without group when zone exists', async () => {
+    const activeDevice = {
+      device_id: deviceId,
+      zone_id: 'zone-1',
+      group_id: '',
+      status: 'active',
+    };
+    deviceRepo.findOne.mockResolvedValue(activeDevice);
+    global.fetch = jest
+      .fn()
+      .mockResolvedValueOnce(makeResponse(200, { zone_id: 'zone-1' }));
 
     await expect(service.getRuntimeDevice(deviceId)).resolves.toEqual(activeDevice);
   });

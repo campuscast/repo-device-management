@@ -20,7 +20,7 @@ export class DevicesController {
 
   @Post('register')
   @UseGuards(JwtAuthGuard, ZoneScopeGuard)
-  async register(@Body() body: { device_name: string; device_type: string; hardware_id?: string; zone_id: string; group_id: string }) {
+  async register(@Body() body: { device_name: string; device_type: string; hardware_id?: string; zone_id: string; group_id?: string }) {
     return this.svc.register(body);
   }
 
@@ -71,7 +71,7 @@ export class DevicesController {
 
   @Put(':deviceId/assign')
   @UseGuards(JwtAuthGuard)
-  async assign(@Param('deviceId') id: string, @Body() body: { group_id: string }) {
+  async assign(@Param('deviceId') id: string, @Body() body: { group_id?: string }) {
     return this.svc.assignToGroup(id, body.group_id);
   }
 
@@ -102,10 +102,10 @@ export class DevicesController {
   @Post('sync-group')
   async syncGroup(@Body() body: { zone_id: string; group_id: string; action: string }) {
     this.logger.log(`Group sync: zone=${body.zone_id} group=${body.group_id} action=${body.action}`);
-    // When a group is deleted, devices in that group must be deprovisioned.
+    // When a group is deleted, devices must remain in the zone and become unassigned.
     if (body.action === 'deleted') {
-      const removed = await this.svc.deleteByGroup(body.group_id);
-      this.logger.log(`Group sync deleted ${removed} device(s) for group=${body.group_id}`);
+      const updated = await this.svc.unassignByGroup(body.group_id);
+      this.logger.log(`Group sync unassigned ${updated} device(s) for group=${body.group_id}`);
     }
     return { synced: true };
   }

@@ -17,7 +17,7 @@ export class Device {
   @Column()
   zone_id: string;
 
-  @Column()
+  @Column({ default: '' })
   group_id: string;
 
   @Column({ default: 'pending' })

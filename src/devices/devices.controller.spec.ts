@@ -2,7 +2,7 @@ import { DevicesController } from './devices.controller';
 
 describe('DevicesController', () => {
   const service = {
-    deleteByGroup: jest.fn(),
+    unassignByGroup: jest.fn(),
     deleteByZone: jest.fn(),
   };
   const controller = new DevicesController(service as any);
@@ -11,8 +11,8 @@ describe('DevicesController', () => {
     jest.resetAllMocks();
   });
 
-  it('syncGroup deletes devices when group is deleted', async () => {
-    service.deleteByGroup.mockResolvedValue(3);
+  it('syncGroup unassigns devices when group is deleted', async () => {
+    service.unassignByGroup.mockResolvedValue(3);
 
     const result = await controller.syncGroup({
       zone_id: 'zone-1',
@@ -21,7 +21,7 @@ describe('DevicesController', () => {
     });
 
     expect(result).toEqual({ synced: true });
-    expect(service.deleteByGroup).toHaveBeenCalledWith('group-1');
+    expect(service.unassignByGroup).toHaveBeenCalledWith('group-1');
   });
 
   it('syncZone deletes devices when zone is deleted', async () => {

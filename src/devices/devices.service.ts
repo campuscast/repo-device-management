@@ -19,6 +19,7 @@ function generatePlayerId(): string {
 }
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const UNGROUPED_TOPIC_SEGMENT = 'devices';
 
 @Injectable()
 export class DevicesService {
@@ -46,6 +47,17 @@ export class DevicesService {
     const compact = raw.replace(/[^0-9a-f]/gi, '').toLowerCase();
     if (compact.length !== 16) return null;
     return /^[0-9a-f]{16}$/.test(compact) ? compact : null;
+  }
+
+  private normalizeGroupId(groupId?: string | null): string {
+    return typeof groupId === 'string' ? groupId.trim() : '';
+  }
+
+  private buildMqttTopicPrefix(device: Pick<Device, 'device_id' | 'zone_id' | 'group_id'>): string {
+    const groupId = this.normalizeGroupId(device.group_id);
+    return groupId
+      ? `zones/${device.zone_id}/groups/${groupId}`
+      : `zones/${device.zone_id}/${UNGROUPED_TOPIC_SEGMENT}/${device.device_id}`;
   }
 
   private async findByShortPlayerId(shortId: string): Promise<Device> {
@@ -162,9 +174,10 @@ export class DevicesService {
     };
   }
 
-  private async createDevice(data: { device_name: string; device_type: string; hardware_id?: string; zone_id: string; group_id: string }) {
+  private async createDevice(data: { device_name: string; device_type: string; hardware_id?: string; zone_id: string; group_id?: string }) {
     const device = this.repo.create({
       ...data,
+      group_id: this.normalizeGroupId(data.group_id),
       device_id: generatePlayerId(),
       status: 'active',
       mqtt_client_id: `dev-${randomUUID().slice(0, 8)}`,
@@ -205,7 +218,7 @@ export class DevicesService {
     });
   }
 
-  async register(data: { device_name: string; device_type: string; hardware_id?: string; zone_id: string; group_id: string }) {
+  async register(data: { device_name: string; device_type: string; hardware_id?: string; zone_id: string; group_id?: string }) {
     const device = await this.createDevice(data);
     const { token, jti, expiresAt } = this.issueDeviceToken(device);
 
@@ -222,7 +235,7 @@ export class DevicesService {
       device_id: device.device_id,
       device_token: token,
       mqtt_client_id: device.mqtt_client_id,
-      mqtt_topic_prefix: `zones/${device.zone_id}/groups/${device.group_id}`,
+      mqtt_topic_prefix: this.buildMqttTopicPrefix(device),
       token_expires_at: expiresAt.toISOString(),
     };
 
@@ -243,14 +256,15 @@ export class DevicesService {
     return response;
   }
 
-  async enroll(data: { device_name: string; device_type: string; hardware_id?: string; zone_id: string; group_id: string }) {
+  async enroll(data: { device_name: string; device_type: string; hardware_id?: string; zone_id: string; group_id?: string }) {
     return this.register(data);
   }
 
   /** Create device with status='pending' — no token issued yet. */
-  async createPending(data: { device_name: string; device_type?: string; hardware_id?: string; zone_id: string; group_id: string }) {
+  async createPending(data: { device_name: string; device_type?: string; hardware_id?: string; zone_id: string; group_id?: string }) {
     const device = this.repo.create({
       ...data,
+      group_id: this.normalizeGroupId(data.group_id),
       device_id: generatePlayerId(),
       device_type: data.device_type || '',
       status: 'pending',
@@ -319,7 +333,7 @@ export class DevicesService {
       device_id: device.device_id,
       device_token: token,
       mqtt_client_id: device.mqtt_client_id,
-      mqtt_topic_prefix: `zones/${device.zone_id}/groups/${device.group_id}`,
+      mqtt_topic_prefix: this.buildMqttTopicPrefix(device),
       token_expires_at: expiresAt.toISOString(),
       already_active: alreadyActive,
     };
@@ -377,20 +391,21 @@ export class DevicesService {
     return saved;
   }
 
-  async assignToGroup(deviceId: string, groupId: string) {
+  async assignToGroup(deviceId: string, groupId?: string) {
     const device = await this.findOne(deviceId);
-    await this.repo.update({ device_id: device.device_id }, { group_id: groupId });
+    const normalizedGroupId = this.normalizeGroupId(groupId);
+    await this.repo.update({ device_id: device.device_id }, { group_id: normalizedGroupId });
     const updated = await this.findOne(device.device_id);
 
     this.appendAudit({
-      event_type: 'device.assigned',
+      event_type: normalizedGroupId ? 'device.assigned' : 'device.unassigned',
       actor_type: 'system',
       actor_id: 'device-management',
       zone_id: updated.zone_id,
       resource_type: 'device',
       resource_id: updated.device_id,
-      action: 'assigned',
-      detail: { group_id: groupId },
+      action: normalizedGroupId ? 'assigned' : 'unassigned',
+      detail: { group_id: normalizedGroupId },
     });
 
     return updated;
@@ -416,11 +431,12 @@ export class DevicesService {
     return { key_id: keyId, success: true };
   }
 
-  private async validateRuntimeAssignment(zoneId: string, groupId: string): Promise<'valid' | 'invalid' | 'unknown'> {
+  private async validateRuntimeAssignment(zoneId: string, groupId?: string): Promise<'valid' | 'invalid' | 'unknown'> {
     try {
       const headers = this.internalServiceToken
         ? { 'x-internal-token': this.internalServiceToken }
         : undefined;
+      const normalizedGroupId = this.normalizeGroupId(groupId);
 
       const zoneRes = await fetch(`${this.zonePolicyUrl}/zones/${encodeURIComponent(zoneId)}`, {
         headers,
@@ -429,6 +445,7 @@ export class DevicesService {
 
       if (zoneRes.status === 404) return 'invalid';
       if (!zoneRes.ok) return 'unknown';
+      if (!normalizedGroupId) return 'valid';
 
       const groupsRes = await fetch(`${this.zonePolicyUrl}/zones/${encodeURIComponent(zoneId)}/groups`, {
         headers,
@@ -441,7 +458,7 @@ export class DevicesService {
       const groups = await groupsRes.json() as Array<{ group_id?: string }>;
       if (!Array.isArray(groups)) return 'unknown';
 
-      const hasGroup = groups.some((group) => group?.group_id === groupId);
+      const hasGroup = groups.some((group) => group?.group_id === normalizedGroupId);
       return hasGroup ? 'valid' : 'invalid';
     } catch {
       return 'unknown';
@@ -456,7 +473,7 @@ export class DevicesService {
    */
   async getRuntimeDevice(deviceId: string): Promise<Device> {
     const device = await this.findOne(deviceId);
-    if (device.status !== 'active' || !device.zone_id || !device.group_id) {
+    if (device.status !== 'active' || !device.zone_id) {
       throw new NotFoundException('Device not found');
     }
 
@@ -482,15 +499,12 @@ export class DevicesService {
     return deviceIds.length;
   }
 
-  async deleteByGroup(groupId: string): Promise<number> {
-    const devices = await this.repo.find({ select: ['device_id'], where: { group_id: groupId } });
-    const deviceIds = devices.map((device) => device.device_id);
-    if (deviceIds.length === 0) return 0;
+  async unassignByGroup(groupId: string): Promise<number> {
+    const normalizedGroupId = this.normalizeGroupId(groupId);
+    if (!normalizedGroupId) return 0;
 
-    await this.credentialRepo.delete({ device_id: In(deviceIds) });
-    await this.repo.delete({ device_id: In(deviceIds) });
-
-    return deviceIds.length;
+    const result = await this.repo.update({ group_id: normalizedGroupId }, { group_id: '' });
+    return result.affected ?? 0;
   }
 
 }
