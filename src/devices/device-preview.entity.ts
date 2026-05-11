@@ -31,6 +31,15 @@ export class DevicePreview {
   @Column({ type: 'int', nullable: true })
   height: number | null;
 
+  @Column({ type: 'varchar', nullable: true })
+  display_id: string | null;
+
+  @Column({ type: 'varchar', nullable: true })
+  display_label: string | null;
+
+  @Column({ type: 'varchar', nullable: true })
+  request_id: string | null;
+
   @UpdateDateColumn()
   updated_at: Date;
 

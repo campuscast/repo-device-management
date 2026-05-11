@@ -39,8 +39,36 @@ export class DevicesController {
 
   @Get(':deviceId/runtime')
   @UseGuards(InternalOrJwtGuard)
-  async getRuntime(@Param('deviceId') id: string) {
-    return this.svc.getRuntimeDevice(id);
+  async getRuntime(@Param('deviceId') id: string, @Req() req: Request & { user?: { sub?: string; device_id?: string }; internalAuth?: { service?: boolean } }) {
+    this.assertDeviceTokenSelfAccess(req, id);
+    return this.svc.getDeviceRuntimeSnapshot(id);
+  }
+
+  @Put(':deviceId/runtime')
+  @UseGuards(InternalOrJwtGuard)
+  async putRuntime(
+    @Param('deviceId') id: string,
+    @Body() body: {
+      current_release_id?: string | null;
+      current_slot_id?: string | null;
+      current_publication_id?: string | null;
+      current_publication_title?: string | null;
+      current_publication_item_id?: string | null;
+      current_publication_item_title?: string | null;
+      playback_status?: string | null;
+      errors?: string[];
+      displays?: unknown;
+      selected_displays?: unknown;
+      timestamp?: string | null;
+      online?: boolean | null;
+      backend_status?: string | null;
+      mqtt_status?: string | null;
+      last_error?: string | null;
+    },
+    @Req() req: Request & { user?: { sub?: string; device_id?: string }; internalAuth?: { service?: boolean } },
+  ) {
+    this.assertDeviceTokenSelfAccess(req, id);
+    return this.svc.updateRuntimeTelemetry(id, body);
   }
 
   @Get(':deviceId/preview')
@@ -62,6 +90,9 @@ export class DevicesController {
       captured_at?: string;
       width?: number;
       height?: number;
+      display_id?: string;
+      display_label?: string;
+      request_id?: string;
     },
     @Req() req: Request & { user?: { sub?: string; device_id?: string }; internalAuth?: { service?: boolean } },
   ) {
@@ -73,6 +104,12 @@ export class DevicesController {
   @UseGuards(JwtAuthGuard)
   async assign(@Param('deviceId') id: string, @Body() body: { group_id?: string }) {
     return this.svc.assignToGroup(id, body.group_id);
+  }
+
+  @Post(':deviceId/preview-request')
+  @UseGuards(JwtAuthGuard)
+  async requestPreview(@Param('deviceId') id: string, @Body() body: { display_id?: string | null }) {
+    return this.svc.requestScreenshot(id, body.display_id);
   }
 
   @Patch(':deviceId')

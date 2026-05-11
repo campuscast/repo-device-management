@@ -20,12 +20,49 @@ function generatePlayerId(): string {
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const UNGROUPED_TOPIC_SEGMENT = 'devices';
+const DEFAULT_RUNTIME_ONLINE_TTL_MS = 45_000;
+
+type RuntimeDisplay = {
+  id: string;
+  label: string;
+  width: number;
+  height: number;
+  selected: boolean;
+};
+
+type RuntimeTelemetryPayload = {
+  current_release_id?: string | null;
+  current_slot_id?: string | null;
+  current_publication_id?: string | null;
+  current_publication_title?: string | null;
+  current_publication_item_id?: string | null;
+  current_publication_item_title?: string | null;
+  playback_status?: string | null;
+  errors?: string[];
+  displays?: unknown;
+  selected_displays?: unknown;
+  timestamp?: string | null;
+  online?: boolean | null;
+  backend_status?: string | null;
+  mqtt_status?: string | null;
+  last_error?: string | null;
+};
+
+type RuntimeScreenshotRequest = {
+  request_id: string;
+  display_id: string;
+  requested_at: string;
+};
 
 @Injectable()
 export class DevicesService {
   private readonly logger = new Logger(DevicesService.name);
   private readonly jwtSecret = process.env.JWT_SECRET || 'dev-secret-change-in-production';
   private readonly tokenTtlSeconds = parseInt(process.env.DEVICE_TOKEN_TTL_SECONDS || '2592000', 10); // 30 days
+  private readonly runtimeOnlineTtlMs = parseInt(
+    process.env.DEVICE_RUNTIME_ONLINE_TTL_MS || `${DEFAULT_RUNTIME_ONLINE_TTL_MS}`,
+    10,
+  );
   private readonly auditClient = new AuditClient();
   private readonly zonePolicyUrl = process.env.ZONE_POLICY_URL || 'http://localhost:3002';
   private readonly internalServiceToken = process.env.INTERNAL_SERVICE_TOKEN || '';
@@ -53,6 +90,144 @@ export class DevicesService {
     return typeof groupId === 'string' ? groupId.trim() : '';
   }
 
+  private normalizeString(value: unknown): string | null {
+    if (typeof value !== 'string') return null;
+    const next = value.trim();
+    return next ? next : null;
+  }
+
+  private normalizeTimestamp(value: unknown, fieldName: string): Date | null {
+    if (value == null || value === '') return null;
+    if (typeof value !== 'string') {
+      throw new BadRequestException(`${fieldName} must be a valid ISO timestamp`);
+    }
+
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) {
+      throw new BadRequestException(`${fieldName} must be a valid ISO timestamp`);
+    }
+    return parsed;
+  }
+
+  private normalizeDisplays(
+    displays: unknown,
+    selectedDisplayIds: string[],
+  ): Array<Record<string, unknown>> {
+    if (!Array.isArray(displays)) return [];
+
+    return displays
+      .map((display) => {
+        if (!display || typeof display !== 'object') return null;
+        const shape = display as Record<string, unknown>;
+        const id = this.normalizeString(shape.id);
+        const width = typeof shape.width === 'number' && Number.isFinite(shape.width)
+          ? Math.max(0, Math.round(shape.width))
+          : null;
+        const height = typeof shape.height === 'number' && Number.isFinite(shape.height)
+          ? Math.max(0, Math.round(shape.height))
+          : null;
+
+        if (!id || width == null || height == null) return null;
+
+        const label = this.normalizeString(shape.label) ?? id;
+        return {
+          id,
+          label,
+          width,
+          height,
+          selected: selectedDisplayIds.includes(id),
+        } as Record<string, unknown>;
+      })
+      .filter((display): display is Record<string, unknown> => Boolean(display));
+  }
+
+  private normalizeSelectedDisplayIds(selectedDisplays: unknown, displays: Array<Record<string, unknown>>): string[] {
+    if (!Array.isArray(selectedDisplays)) return [];
+    const knownDisplayIds = new Set(
+      displays
+        .map((display) => (typeof display.id === 'string' ? display.id : ''))
+        .filter(Boolean),
+    );
+
+    return selectedDisplays
+      .map((displayId) => (typeof displayId === 'string' ? displayId.trim() : ''))
+      .filter((displayId) => Boolean(displayId) && (knownDisplayIds.size === 0 || knownDisplayIds.has(displayId)));
+  }
+
+  private getStoredDisplays(device: Device): RuntimeDisplay[] {
+    const rawDisplays = Array.isArray(device.display_metadata) ? device.display_metadata : [];
+    return rawDisplays
+      .map((display) => {
+        if (!display || typeof display !== 'object') return null;
+        const shape = display as Record<string, unknown>;
+        const id = typeof shape.id === 'string' ? shape.id : '';
+        const label = typeof shape.label === 'string' ? shape.label : id;
+        const width = typeof shape.width === 'number' ? shape.width : null;
+        const height = typeof shape.height === 'number' ? shape.height : null;
+        if (!id || width == null || height == null) return null;
+
+        return {
+          id,
+          label,
+          width,
+          height,
+          selected: typeof shape.selected === 'boolean'
+            ? shape.selected
+            : Array.isArray(device.selected_display_ids) && device.selected_display_ids.includes(id),
+        };
+      })
+      .filter((display): display is RuntimeDisplay => Boolean(display));
+  }
+
+  private buildPendingScreenshotRequest(device: Device): RuntimeScreenshotRequest | null {
+    if (!device.pending_screenshot_request_id || !device.pending_screenshot_display_id || !device.pending_screenshot_requested_at) {
+      return null;
+    }
+
+    return {
+      request_id: device.pending_screenshot_request_id,
+      display_id: device.pending_screenshot_display_id,
+      requested_at: device.pending_screenshot_requested_at.toISOString(),
+    };
+  }
+
+  private isRuntimeTelemetryFresh(lastTelemetryAt: Date | null): boolean {
+    if (!(lastTelemetryAt instanceof Date) || Number.isNaN(lastTelemetryAt.getTime())) {
+      return false;
+    }
+    return Date.now() - lastTelemetryAt.getTime() <= this.runtimeOnlineTtlMs;
+  }
+
+  private isDeviceOnline(device: Pick<Device, 'online' | 'last_telemetry_at'>): boolean {
+    return device.online === true && this.isRuntimeTelemetryFresh(device.last_telemetry_at);
+  }
+
+  private buildRuntimeSnapshot(device: Device) {
+    const online = this.isDeviceOnline(device);
+    return {
+      device_id: device.device_id,
+      device_name: device.device_name,
+      zone_id: device.zone_id,
+      group_id: device.group_id,
+      status: device.status,
+      current_release_id: device.current_release_id ?? null,
+      current_slot_id: device.current_slot_id ?? null,
+      current_publication_id: device.current_publication_id ?? null,
+      current_publication_title: device.current_publication_title ?? null,
+      current_publication_item_id: device.current_publication_item_id ?? null,
+      current_publication_item_title: device.current_publication_item_title ?? null,
+      playback_status: device.playback_status ?? null,
+      online,
+      backend_status: device.backend_status ?? null,
+      mqtt_status: device.mqtt_status ?? null,
+      last_error: device.last_error ?? null,
+      last_telemetry_at: device.last_telemetry_at?.toISOString?.() || null,
+      displays: this.getStoredDisplays(device),
+      selected_display_ids: Array.isArray(device.selected_display_ids) ? device.selected_display_ids : [],
+      screenshot_request: this.buildPendingScreenshotRequest(device),
+    };
+  }
+
   private buildMqttTopicPrefix(device: Pick<Device, 'device_id' | 'zone_id' | 'group_id'>): string {
     const groupId = this.normalizeGroupId(device.group_id);
     return groupId
@@ -77,7 +252,11 @@ export class DevicesService {
   }
 
   async findByZone(zoneId: string) {
-    return this.repo.find({ where: { zone_id: zoneId } });
+    const devices = await this.repo.find({ where: { zone_id: zoneId } });
+    return devices.map((device) => ({
+      ...device,
+      online: this.isDeviceOnline(device),
+    }));
   }
 
   async findOne(deviceId: string) {
@@ -108,6 +287,9 @@ export class DevicesService {
         zone_id: device.zone_id,
         group_id: device.group_id,
         preview_available: false,
+        display_id: null,
+        display_label: null,
+        request_id: null,
         updated_at: null,
       };
     }
@@ -125,8 +307,16 @@ export class DevicesService {
       captured_at: preview.captured_at?.toISOString?.() || null,
       width: preview.width,
       height: preview.height,
+      display_id: preview.display_id,
+      display_label: preview.display_label,
+      request_id: preview.request_id,
       updated_at: preview.updated_at?.toISOString?.() || null,
     };
+  }
+
+  async getDeviceRuntimeSnapshot(deviceId: string) {
+    const device = await this.findOne(deviceId);
+    return this.buildRuntimeSnapshot(device);
   }
 
   async upsertDevicePreview(deviceId: string, payload: {
@@ -137,13 +327,19 @@ export class DevicesService {
     captured_at?: string;
     width?: number;
     height?: number;
+    display_id?: string;
+    display_label?: string;
+    request_id?: string;
   }) {
     const device = await this.findOne(deviceId);
     const current = await this.previewRepo.findOne({ where: { device_id: device.device_id } });
-    const capturedAt = payload.captured_at ? new Date(payload.captured_at) : null;
-    if (payload.captured_at && (!capturedAt || Number.isNaN(capturedAt.getTime()))) {
-      throw new BadRequestException('captured_at must be a valid ISO timestamp');
-    }
+    const capturedAt = this.normalizeTimestamp(payload.captured_at, 'captured_at');
+    const requestedDisplayId = this.normalizeString(payload.display_id);
+    const displayLabelFromInventory = requestedDisplayId
+      ? this.getStoredDisplays(device).find((display) => display.id === requestedDisplayId)?.label ?? null
+      : null;
+    const requestedDisplayLabel = this.normalizeString(payload.display_label) ?? displayLabelFromInventory;
+    const requestId = this.normalizeString(payload.request_id);
 
     const next = current
       ? { ...current }
@@ -156,6 +352,9 @@ export class DevicesService {
           captured_at: null,
           width: null,
           height: null,
+          display_id: null,
+          display_label: null,
+          request_id: null,
         });
 
     if (payload.image_base64 !== undefined) next.image_base64 = payload.image_base64 || null;
@@ -164,13 +363,92 @@ export class DevicesService {
     if (payload.status !== undefined) next.status = payload.status || null;
     if (payload.width !== undefined) next.width = Number.isFinite(payload.width) ? payload.width : null;
     if (payload.height !== undefined) next.height = Number.isFinite(payload.height) ? payload.height : null;
-    if (capturedAt) next.captured_at = capturedAt;
+    if (payload.display_id !== undefined) next.display_id = requestedDisplayId;
+    if (payload.display_label !== undefined || payload.display_id !== undefined) next.display_label = requestedDisplayLabel;
+    if (payload.request_id !== undefined) next.request_id = requestId;
+    if (payload.captured_at !== undefined) next.captured_at = capturedAt;
 
     const saved = await this.previewRepo.save(next);
+    if (requestId && device.pending_screenshot_request_id === requestId) {
+      await this.repo.update(
+        { device_id: device.device_id },
+        {
+          pending_screenshot_request_id: null,
+          pending_screenshot_display_id: null,
+          pending_screenshot_requested_at: null,
+        },
+      );
+    }
+
     return {
       preview_id: saved.preview_id,
       device_id: saved.device_id,
       updated_at: saved.updated_at?.toISOString?.() || null,
+    };
+  }
+
+  async updateRuntimeTelemetry(deviceId: string, payload: RuntimeTelemetryPayload) {
+    const device = await this.getRuntimeDevice(deviceId);
+    const selectedDisplayIds = this.normalizeSelectedDisplayIds(payload.selected_displays, this.normalizeDisplays(payload.displays, []));
+    const displays = this.normalizeDisplays(payload.displays, selectedDisplayIds);
+    const lastTelemetryAt = this.normalizeTimestamp(payload.timestamp, 'timestamp') ?? new Date();
+
+    device.current_release_id = this.normalizeString(payload.current_release_id);
+    device.current_slot_id = this.normalizeString(payload.current_slot_id);
+    device.current_publication_id = this.normalizeString(payload.current_publication_id);
+    device.current_publication_title = this.normalizeString(payload.current_publication_title);
+    device.current_publication_item_id = this.normalizeString(payload.current_publication_item_id);
+    device.current_publication_item_title = this.normalizeString(payload.current_publication_item_title);
+    device.playback_status = this.normalizeString(payload.playback_status);
+    device.online = typeof payload.online === 'boolean' ? payload.online : null;
+    device.backend_status = this.normalizeString(payload.backend_status);
+    device.mqtt_status = this.normalizeString(payload.mqtt_status);
+    device.last_error = this.normalizeString(payload.last_error)
+      ?? (Array.isArray(payload.errors) ? this.normalizeString(payload.errors.at(-1)) : null);
+    device.last_telemetry_at = lastTelemetryAt;
+    device.display_metadata = displays;
+    device.selected_display_ids = selectedDisplayIds;
+    device.last_seen = new Date();
+
+    const saved = await this.repo.save(device);
+    return {
+      screenshot_request: this.buildPendingScreenshotRequest(saved),
+    };
+  }
+
+  async requestScreenshot(deviceId: string, displayId?: string | null) {
+    const device = await this.getRuntimeDevice(deviceId);
+    const displays = this.getStoredDisplays(device);
+    if (displays.length === 0) {
+      throw new BadRequestException('No display telemetry available for this device yet');
+    }
+
+    const selectedDisplayId = this.normalizeString(displayId);
+    const requestedDisplay = selectedDisplayId
+      ? displays.find((display) => display.id === selectedDisplayId)
+      : displays.find((display) => display.selected) ?? displays[0];
+
+    if (!requestedDisplay) {
+      throw new BadRequestException('Display not found for this device');
+    }
+
+    const requestId = randomUUID();
+    const requestedAt = new Date();
+
+    await this.repo.update(
+      { device_id: device.device_id },
+      {
+        pending_screenshot_request_id: requestId,
+        pending_screenshot_display_id: requestedDisplay.id,
+        pending_screenshot_requested_at: requestedAt,
+      },
+    );
+
+    return {
+      device_id: device.device_id,
+      request_id: requestId,
+      display_id: requestedDisplay.id,
+      requested_at: requestedAt.toISOString(),
     };
   }
 

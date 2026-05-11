@@ -50,6 +50,8 @@ describe('DevicesService preview support', () => {
 
     expect(result.preview_available).toBe(false);
     expect(result.device_name).toBe('Lobby TV');
+    expect(result.request_id).toBeNull();
+    expect(result.display_id).toBeNull();
   });
 
   it('creates new preview snapshot on first upload', async () => {
@@ -79,6 +81,45 @@ describe('DevicesService preview support', () => {
     expect(previewRepo.create).toHaveBeenCalledTimes(1);
     expect(previewRepo.save).toHaveBeenCalledTimes(1);
     expect(result.device_id).toBe(deviceId);
+  });
+
+  it('clears pending screenshot request after matching preview upload', async () => {
+    const nowIso = '2026-03-20T12:00:00.000Z';
+    deviceRepo.findOne.mockResolvedValue({
+      device_id: deviceId,
+      device_name: 'Lobby TV',
+      zone_id: 'zone-1',
+      group_id: 'group-1',
+      display_metadata: [{ id: 'display-1', label: 'Lobby screen', width: 1920, height: 1080, selected: true }],
+      selected_display_ids: ['display-1'],
+      pending_screenshot_request_id: 'request-1',
+      pending_screenshot_display_id: 'display-1',
+      pending_screenshot_requested_at: new Date(nowIso),
+    });
+    previewRepo.findOne.mockResolvedValue(null);
+    previewRepo.create.mockImplementation((payload: Record<string, unknown>) => payload);
+    previewRepo.save.mockResolvedValue({
+      preview_id: 'preview-1',
+      device_id: deviceId,
+      updated_at: new Date(nowIso),
+    });
+    deviceRepo.update.mockResolvedValue({ affected: 1 });
+
+    await service.upsertDevicePreview(deviceId, {
+      captured_at: nowIso,
+      status: 'ok',
+      request_id: 'request-1',
+      display_id: 'display-1',
+    });
+
+    expect(deviceRepo.update).toHaveBeenCalledWith(
+      { device_id: deviceId },
+      {
+        pending_screenshot_request_id: null,
+        pending_screenshot_display_id: null,
+        pending_screenshot_requested_at: null,
+      },
+    );
   });
 
   it('rejects invalid captured_at value', async () => {
